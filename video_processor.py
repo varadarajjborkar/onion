@@ -1,5 +1,7 @@
 
 import subprocess
+import sys
+import threading
 
 import cv2
 import numpy as np
@@ -36,6 +38,62 @@ def encode_jpeg(rgb_frame):
     ok, buffer = cv2.imencode(".jpg", bgr)
 
     return buffer.tobytes()
+
+
+def clock(seconds):
+
+    seconds = int(seconds)
+
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+class Spinner:
+
+    FRAMES = "|/-\\"
+    WIDTH = 100
+
+    def __init__(self, text=""):
+
+        self.text = text
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = None
+
+    def _spin(self):
+
+        i = 0
+
+        while not self._stop.is_set():
+
+            with self._lock:
+                sys.stdout.write(f"\r{self.FRAMES[i % len(self.FRAMES)]} {self.text}".ljust(self.WIDTH))
+                sys.stdout.flush()
+
+            i += 1
+            self._stop.wait(0.1)
+
+    def __enter__(self):
+
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+        self._thread.start()
+
+        return self
+
+    def __exit__(self, *exc):
+
+        self._stop.set()
+        self._thread.join()
+
+        with self._lock:
+            sys.stdout.write("\r" + " " * self.WIDTH + "\r")
+            sys.stdout.flush()
+
+    def log(self, line):
+
+        # Print a finished line above the spinner without breaking it
+        with self._lock:
+            sys.stdout.write("\r" + " " * self.WIDTH + "\r" + line + "\n")
+            sys.stdout.flush()
 
 
 # -----------------------------------------
@@ -245,12 +303,13 @@ class VideoProcessor:
         }
 
     # -----------------------------------------
-    # 5. SUMMARY (a few frames + audio levels -> LLM)
+    # 5. SEGMENT SUMMARIES (frames + audio levels per time window -> LLM)
     # -----------------------------------------
 
-    def summarize(self, max_frames=8, model=None):
+    def summarize(self, segment_seconds=10, frames_per_segment=2, model=None):
 
-        result = self.process_video_file()
+        with Spinner("Decoding video and audio"):
+            result = self.process_video_file()
 
         frames = result["video"]["frames"]
         frame_times = result["video"]["timestamps"]
@@ -258,26 +317,50 @@ class VideoProcessor:
         audio = result["audio"]["spectrograms"]
         audio_times = result["audio"]["timestamps"]
 
-        # Evenly spaced frames across the whole video
-        picks = np.linspace(0, len(frames) - 1, min(max_frames, len(frames))).astype(int)
-
-        images = [encode_jpeg(frames[i]) for i in picks]
-
-        labels = [f"Frame {n + 1} at {frame_times[i]:.0f}s" for n, i in enumerate(picks)]
-
         # Audio level per second, from the mean of each log spectrogram
         levels = audio.mean(axis=(1, 2))
-        loudest = np.argsort(-levels)[:3]
 
-        prompt = (
-            "Summarize this video from the frames and audio levels below. "
-            "Describe what happens, any on-screen text, and the main topic in a short paragraph. "
-            "If the frames are not enough to tell, say so.\n\n"
-            + "\n".join(labels)
-            + f"\n\nAudio: average level {levels.mean():.1f} dB. "
-            + "Loudest seconds: "
-            + ", ".join(f"{audio_times[i]:.0f}s" for i in loudest)
-            + "."
-        )
+        total = len(audio_times) * AUDIO_CHUNK_SECONDS
 
-        return llm_env.describe(images, prompt, model=model)
+        starts = np.arange(0, total, segment_seconds)
+
+        results = []
+
+        with Spinner("") as spinner:
+
+            for n, start in enumerate(starts, 1):
+
+                end = min(start + segment_seconds, total)
+
+                spinner.text = f"Summarizing segment {n}/{len(starts)}"
+
+                # Evenly spaced frames inside this window
+                in_window = np.where((frame_times >= start) & (frame_times < end))[0]
+
+                picks = in_window[np.linspace(0, len(in_window) - 1, min(frames_per_segment, len(in_window))).astype(int)] if len(in_window) else []
+
+                images = [encode_jpeg(frames[i]) for i in picks]
+
+                labels = [f"Frame {k + 1} at {clock(frame_times[i])}" for k, i in enumerate(picks)]
+
+                window_audio = np.where((audio_times >= start) & (audio_times < end))[0]
+
+                prompt = (
+                    f"Summarize this part of a video, from {clock(start)} to {clock(end)}. "
+                    "Describe what happens and any on-screen text in one or two sentences. "
+                    "If the frames are not enough to tell, say so.\n\n"
+                    + "\n".join(labels)
+                    + f"\n\nAudio: average level {levels[window_audio].mean():.1f} dB."
+                )
+
+                summary = llm_env.describe(images, prompt, model=model)
+
+                spinner.log(f"[{n}/{len(starts)}] {clock(start)}-{clock(end)}  {summary}")
+
+                results.append({
+                    "start": float(start),
+                    "end": float(end),
+                    "summary": summary
+                })
+
+        return results

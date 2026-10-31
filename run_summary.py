@@ -8,6 +8,6 @@ from video_processor import VideoProcessor
 
 processor = VideoProcessor("sample/sample.mp4")
 
-summary = processor.summarize(max_frames=8)
+segments = processor.summarize(segment_seconds=10, frames_per_segment=2)
 
-print(summary)
+print(f"\nDone: {len(segments)} segments summarized.")
