@@ -7,6 +7,7 @@ import cv2
 import numpy as np
 import soundfile as sf
 
+from faster_whisper import WhisperModel
 from pathlib import Path
 from scipy.signal import stft
 
@@ -25,6 +26,9 @@ VIDEO_FRAME_SIZE = (224, 224)
 # Audio STFT configuration
 N_FFT = 400
 HOP_LENGTH = 160
+
+# Speech-to-text model (faster-whisper, runs locally on CPU)
+WHISPER_MODEL = "base"
 
 
 # -----------------------------------------
@@ -281,7 +285,27 @@ class VideoProcessor:
         }
 
     # -----------------------------------------
-    # 4. COMPLETE PIPELINE
+    # 4. SPEECH TO TEXT (timed transcript of the audio)
+    # -----------------------------------------
+
+    def transcribe(self, audio_path=None, model_size=WHISPER_MODEL):
+
+        audio_path = audio_path or self.output_dir / "audio.wav"
+
+        # Already 16 kHz mono float32 from extract_streams, so pass the samples directly
+        waveform, _ = sf.read(audio_path, dtype="float32")
+
+        model = WhisperModel(model_size, device="cpu", compute_type="int8")
+
+        segments, _ = model.transcribe(waveform, vad_filter=True)
+
+        return [
+            {"start": s.start, "end": s.end, "text": s.text.strip()}
+            for s in segments
+        ]
+
+    # -----------------------------------------
+    # 5. COMPLETE PIPELINE
     # -----------------------------------------
 
     def process_video_file(self):
@@ -303,13 +327,16 @@ class VideoProcessor:
         }
 
     # -----------------------------------------
-    # 5. SEGMENT SUMMARIES (frames + audio levels per time window -> LLM)
+    # 6. SEGMENT SUMMARIES (frames + speech + audio levels per time window -> LLM)
     # -----------------------------------------
 
     def summarize(self, segment_seconds=10, frames_per_segment=2, model=None):
 
         with Spinner("Decoding video and audio"):
             result = self.process_video_file()
+
+        with Spinner("Transcribing speech"):
+            speech = self.transcribe()
 
         frames = result["video"]["frames"]
         frame_times = result["video"]["timestamps"]
@@ -345,12 +372,16 @@ class VideoProcessor:
 
                 window_audio = np.where((audio_times >= start) & (audio_times < end))[0]
 
+                # Transcript lines that overlap this window
+                spoken = " ".join(t["text"] for t in speech if t["start"] < end and t["end"] > start)
+
                 prompt = (
                     f"Summarize this part of a video, from {clock(start)} to {clock(end)}. "
-                    "Describe what happens and any on-screen text in one or two sentences. "
-                    "If the frames are not enough to tell, say so.\n\n"
+                    "Describe what happens, what is said, and any on-screen text in one or two sentences. "
+                    "If the frames and speech are not enough to tell, say so.\n\n"
                     + "\n".join(labels)
                     + f"\n\nAudio: average level {levels[window_audio].mean():.1f} dB."
+                    + f"\nSpeech: {spoken or 'none'}"
                 )
 
                 summary = llm_env.describe(images, prompt, model=model)
