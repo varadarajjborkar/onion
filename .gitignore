@@ -3,3 +3,4 @@ processed/
 __pycache__/
 llm_env.py
 sample/*
+logs/*
