@@ -75,16 +75,16 @@ def load_json(path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def ask(prompt, model=None, images=()):
+def ask(prompt, model=None, images=(), tries=LLM_TRIES):
 
-    for attempt in range(1, LLM_TRIES + 1):
+    for attempt in range(1, tries + 1):
 
         try:
             return llm_env.describe(list(images), prompt, model=model)
 
         except (RuntimeError, OSError) as err:
 
-            if attempt == LLM_TRIES:
+            if attempt == tries:
                 raise
 
             time.sleep(LLM_BACKOFF_S * 2 ** (attempt - 1))

@@ -8,6 +8,7 @@ import numpy as np
 from collections import Counter
 from pathlib import Path
 
+from cross_encoder import CrossEncoder
 from ingest import ask, atomic_write, load_json, save_json
 from video_processor import clock
 
@@ -40,7 +41,16 @@ SHIFT_WINDOW_WORDS = 80
 # How the border signals are combined (sums to 1). The topic signal is ranked against the rest of the
 # video, so it says "more of a shift than most places here", whatever the video. "llm" is the LLM's
 # own reading of where a new part starts; without it the others are scaled up to fill its place.
-BORDER_WEIGHTS = {"pause": 0.12, "sentence": 0.08, "topic": 0.25, "entity": 0.10, "llm": 0.45}
+BORDER_WEIGHTS = {"pause": 0.12, "sentence": 0.08, "topic": 0.25, "entity": 0.10, "llm": 0.45, "cross": 0.0}
+
+# The cross-encoder signal reads the words before and after a border together and asks whether they belong
+# to one passage. It is off (weight 0) until you give it a weight, for example
+#   --set=onion.BORDER_WEIGHTS='{"pause":0.12,"sentence":0.08,"topic":0.0,"entity":0.10,"llm":0.45,"cross":0.25}'
+CROSS_MODEL = "cross-encoder/stsb-TinyBERT-L-4"
+CROSS_ONNX = "onnx/model.onnx"
+
+# Words taken on each side of a border; several sizes are averaged so both a short and a long view count
+CROSS_SCALES = [30, 80]
 
 # Lines (sentences or pauses) shown to the LLM per call when it looks for new parts, and how many repeat
 LLM_BORDER_LINES = 50
@@ -247,6 +257,9 @@ def border_candidates(words, context):
             }
         })
 
+    if BORDER_WEIGHTS.get("cross", 0) > 0 and candidates:
+        add_cross_signal(words, candidates)
+
     # Rank the topic shift against this video's other places: 1.0 is its biggest shift, 0.0 its smallest
     raw = np.array([c["signals"]["topic"] for c in candidates])
 
@@ -256,6 +269,33 @@ def border_candidates(words, context):
             c["signals"]["topic"] = float(r)
 
     return candidates
+
+
+def add_cross_signal(words, candidates):
+
+    encoder = CrossEncoder(CROSS_MODEL, CROSS_ONNX)
+
+    pairs = []
+
+    for c in candidates:
+
+        i = c["idx"]
+
+        for n in CROSS_SCALES:
+
+            before = " ".join(w["text"] for w in words[max(0, i + 1 - n):i + 1])
+            after = " ".join(w["text"] for w in words[i + 1:i + 1 + n])
+
+            # Both orders, so which side is read first does not matter
+            pairs += [(before, after), (after, before)]
+
+    scores = encoder.score(pairs).reshape(len(candidates), len(CROSS_SCALES) * 2).mean(axis=1)
+
+    # How much the passages belong together, ranked against this video; low belonging is a likely border
+    belong = scores.argsort().argsort() / max(len(scores) - 1, 1)
+
+    for c, b in zip(candidates, belong):
+        c["signals"]["cross"] = float(1.0 - b)
 
 
 def llm_border_strengths(words, candidates, summary, cache, model, save):
@@ -308,7 +348,7 @@ def llm_border_strengths(words, candidates, summary, cache, model, save):
 def score_candidates(candidates, strengths=None):
 
     # Without the LLM signal the others are scaled up to fill its weight
-    weights = {k: v for k, v in BORDER_WEIGHTS.items() if k != "llm" or strengths is not None}
+    weights = {k: v for k, v in BORDER_WEIGHTS.items() if v > 0 and (k != "llm" or strengths is not None)}
 
     total = sum(weights.values())
 
@@ -501,7 +541,7 @@ def build_cues(words, lo, hi, llm_found, ents, emphasis):
 # THE ONION: layers combined into weighted segments
 # -----------------------------------------
 
-def onion(manifest_path="processed/ingest.json", use_llm=True, model=None, force=False):
+def onion(manifest_path="processed/ingest.json", use_llm=True, model=None, force=False, tag=None, llm_cues=True):
 
     manifest_path = Path(manifest_path)
     out_dir = manifest_path.parent
@@ -511,9 +551,11 @@ def onion(manifest_path="processed/ingest.json", use_llm=True, model=None, force
 
     words = flatten_words(manifest["transcript"])
 
+    out_name = f"onion.{tag}.json" if tag else "onion.json"
+
     if not words:
         result = {"params": params(), "llm_layer": "skipped", "segments": []}
-        save_json(out_dir / "onion.json", result)
+        save_json(out_dir / out_name, result)
         return result
 
     ents = entity_tokens(context)
@@ -557,7 +599,7 @@ def onion(manifest_path="processed/ingest.json", use_llm=True, model=None, force
 
         key = f"{lo}-{hi}"
 
-        if use_llm and key not in cache["segments"] and llm_state == "ok":
+        if use_llm and llm_cues and key not in cache["segments"] and llm_state == "ok":
 
             try:
                 cache["segments"][key] = llm_matches(words, lo, hi, context.get("summary"), model)
@@ -602,7 +644,7 @@ def onion(manifest_path="processed/ingest.json", use_llm=True, model=None, force
 
     result = {"params": params(), "llm_layer": llm_state, "segments": segments}
 
-    save_json(out_dir / "onion.json", result)
+    save_json(out_dir / out_name, result)
 
     return result
 

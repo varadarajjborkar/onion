@@ -21,6 +21,13 @@ WORKERS = 3
 # Images are sent no wider than this; the full size stays on disk
 SEND_WIDTH = 1280
 
+# One stuck request must not hold up the whole run: shorter wait and fewer retries than for text
+VISION_TIMEOUT_S = 90
+VISION_TRIES = 2
+
+# The vision LLM stalls on very thin images, so a crop is padded until it is no thinner than this
+MAX_ASPECT = 3.0
+
 # At most this many named things are taken per keyframe (the biggest, most visible come first in the reply)
 MAX_ITEMS = 10
 
@@ -57,6 +64,16 @@ def jpeg_bytes(path, width=SEND_WIDTH):
 
     if image.shape[1] > width:
         image = cv2.resize(image, (width, int(image.shape[0] * width / image.shape[1])), interpolation=cv2.INTER_AREA)
+
+    h, w = image.shape[:2]
+
+    # Pad a thin sliver with neutral grey to a sensible shape
+    if w / h > MAX_ASPECT:
+        pad = int(w / MAX_ASPECT - h)
+        image = cv2.copyMakeBorder(image, pad // 2, pad - pad // 2, 0, 0, cv2.BORDER_CONSTANT, value=(128, 128, 128))
+    elif h / w > MAX_ASPECT:
+        pad = int(h / MAX_ASPECT - w)
+        image = cv2.copyMakeBorder(image, 0, 0, pad // 2, pad - pad // 2, cv2.BORDER_CONSTANT, value=(128, 128, 128))
 
     return cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 88])[1].tobytes()
 
@@ -115,20 +132,28 @@ def run_parallel(tasks, work, out_path, model=None):
             done[key] = answer
             save_json(out_path, done)
 
-    with ThreadPoolExecutor(WORKERS) as pool:
-        list(pool.map(one, pending))
+    import llm_env
+
+    normal = llm_env.TIMEOUT_S
+    llm_env.TIMEOUT_S = min(normal, VISION_TIMEOUT_S)
+
+    try:
+        with ThreadPoolExecutor(WORKERS) as pool:
+            list(pool.map(one, pending))
+    finally:
+        llm_env.TIMEOUT_S = normal
 
     return {k: done[k] for k in tasks if k in done}, len(failed)
 
 
 def discover_one(path, model):
 
-    return clean_discovery(ask(DISCOVER_PROMPT, model, [jpeg_bytes(path)]))
+    return clean_discovery(ask(DISCOVER_PROMPT, model, [jpeg_bytes(path)], tries=VISION_TRIES))
 
 
 def caption_one(path, model):
 
-    return ask(CAPTION_PROMPT, model, [jpeg_bytes(path, 640)]).strip()
+    return ask(CAPTION_PROMPT, model, [jpeg_bytes(path, 640)], tries=VISION_TRIES).strip()
 
 
 def discover(images, out_path, model=None):

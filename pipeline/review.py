@@ -62,6 +62,10 @@ def build(manifest_path="processed/ingest.json"):
     agents_path = base / "agent" / "summary.json"
     agents = load_json(agents_path) if agents_path.exists() else None
 
+    # Results from an earlier chunking do not belong to these segments; leave them out until the agents run again
+    if agents is not None and [r["id"] for r in agents["segments"]] != [s["id"] for s in onion["segments"]]:
+        agents = None
+
     cap = cv2.VideoCapture(manifest["video"]["path"])
 
     plan_by_id = {s["id"]: s for s in plan["segments"]}
