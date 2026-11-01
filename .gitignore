@@ -1,10 +1,10 @@
 .venv/
-processed/
+processed/*
 __pycache__/
 llm_env.py
 sample/*
 logs/*
 *.txt
 mine.py
-data/
-runs/
+data/*
+runs/*
