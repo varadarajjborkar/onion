@@ -4,3 +4,4 @@ __pycache__/
 llm_env.py
 sample/*
 logs/*
+*.txt
