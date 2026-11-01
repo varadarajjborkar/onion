@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Video Pipeline Review</title>
+<style>
+:root {
+  --bg: #fafaf8; --panel: #ffffff; --text: #1c1c1a; --muted: #6b6b66; --line: #e3e3dd;
+  --accent: #2f6fdb; --good: #2a8f55; --bad: #c8412f; --warn: #b9831a;
+  --static: #cfd8dc; --subject_motion: #f3c969; --camera_move: #7bb6e8; --camera_shaky: #e38b6b; --cut: #a37ad6;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #151514; --panel: #1f1f1d; --text: #ecece8; --muted: #9c9c95; --line: #34342f;
+    --accent: #6a9df0; --good: #5cc88a; --bad: #ec7a68; --warn: #e0b04c;
+    --static: #46515a; --subject_motion: #a8842f; --camera_move: #3f7aa8; --camera_shaky: #a85d3f; --cut: #7550a3;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #151514; --panel: #1f1f1d; --text: #ecece8; --muted: #9c9c95; --line: #34342f;
+  --accent: #6a9df0; --good: #5cc88a; --bad: #ec7a68; --warn: #e0b04c;
+  --static: #46515a; --subject_motion: #a8842f; --camera_move: #3f7aa8; --camera_shaky: #a85d3f; --cut: #7550a3;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 1040px; margin: 0 auto; padding: 0 16px 80px; }
+h1 { font-size: 24px; margin: 28px 0 4px; }
+h2 { font-size: 19px; margin: 40px 0 6px; padding-top: 8px; }
+p.lead { color: var(--muted); margin: 0 0 14px; }
+.bar { position: sticky; top: 0; z-index: 5; background: var(--bg); border-bottom: 1px solid var(--line); }
+.bar-in { max-width: 1040px; margin: 0 auto; padding: 8px 16px; display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+.bar a { color: var(--text); text-decoration: none; font-size: 14px; padding: 2px 0; border-bottom: 2px solid transparent; }
+.bar a:hover { border-color: var(--accent); }
+.bar .sp { flex: 1; }
+.count { color: var(--muted); font-size: 13px; }
+button { font: inherit; font-size: 13px; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+button:hover { border-color: var(--accent); }
+button.on-yes { background: var(--good); border-color: var(--good); color: #fff; }
+button.on-no { background: var(--bad); border-color: var(--bad); color: #fff; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin: 10px 0; }
+.row { display: flex; gap: 12px; flex-wrap: wrap; }
+.row > .grow { flex: 1; min-width: 240px; }
+.thumbs { display: flex; gap: 6px; flex-wrap: wrap; }
+.thumbs figure { margin: 0; width: 150px; }
+.thumbs img { width: 150px; border-radius: 6px; display: block; border: 1px solid var(--line); }
+.thumbs figcaption { font-size: 12px; color: var(--muted); }
+.chip { display: inline-block; font-size: 12px; padding: 1px 8px; border-radius: 99px; border: 1px solid var(--line); color: var(--muted); margin-right: 4px; }
+.chip.hot { border-color: var(--warn); color: var(--warn); }
+mark { background: color-mix(in srgb, var(--warn) 35%, transparent); color: inherit; border-radius: 3px; padding: 0 2px; }
+.muted { color: var(--muted); }
+.small { font-size: 13px; }
+.timeline { display: flex; height: 34px; gap: 2px; margin: 8px 0 14px; }
+.timeline div { background: var(--accent); border-radius: 3px; cursor: pointer; min-width: 3px; }
+.timeline div.hot { outline: 2px solid var(--warn); outline-offset: 1px; }
+.strip { display: flex; height: 34px; gap: 1px; margin: 8px 0; }
+.strip div { flex: 1; cursor: pointer; border-radius: 2px; }
+.strip div.changed { outline: 2px solid var(--text); outline-offset: -2px; }
+.legend span { display: inline-flex; align-items: center; gap: 5px; margin-right: 12px; font-size: 13px; }
+.legend i { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+.stack { display: flex; height: 8px; border-radius: 4px; overflow: hidden; width: 160px; background: var(--line); }
+details summary { cursor: pointer; color: var(--accent); }
+pre { white-space: pre-wrap; margin: 6px 0 0; font: inherit; }
+code { font: 13px ui-monospace, Menlo, monospace; background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+td, th { text-align: left; padding: 3px 8px 3px 0; vertical-align: top; }
+@media (max-width: 600px) { .thumbs figure, .thumbs img { width: 46vw; } }
+</style>
+</head>
+<body>
+<div class="bar"><div class="bar-in">
+  <strong>Review</strong>
+  <a href="#ingest">1 Ingest</a><a href="#onion">2 Onion</a><a href="#plan">3 Plan</a><a href="#masks">4 Masks</a><a href="#agents">5 Agents</a>
+  <span class="sp"></span>
+  <span class="count" id="count"></span>
+  <button id="download">Download feedback.json</button>
+</div></div>
+<main id="app"></main>
+
+<script>
+const D = __DATA__;
+
+const store = {
+  get(k) { try { return JSON.parse(localStorage.getItem(k)); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+};
+const KEY = 'review:' + D.video.key;
+const fb = store.get(KEY) || { pointing: {}, situation: {} };
+const served = location.protocol.startsWith('http');
+
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const fmt = s => { s = Math.floor(s); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
+const pct = v => Math.round(v * 100) + '%';
+function exportState() {
+  return {
+    video: D.video.key,
+    pointing: fb.pointing,
+    situation: Object.entries(fb.situation).map(([i, label]) => ({ start: D.plan.windows[i].start, end: D.plan.windows[i].end, label }))
+  };
+}
+
+// When the page is opened through run_review.py, every mark is also written to processed/review/feedback.json
+async function push() {
+  if (!served) return;
+  try { await fetch('/feedback', { method: 'POST', body: JSON.stringify(exportState()) }); setStatus('saved to disk'); }
+  catch (e) { setStatus('could not save to disk, use Download'); }
+}
+
+async function pull() {
+  if (!served) return;
+  try {
+    const r = await fetch('/feedback.json?' + Date.now());
+    if (!r.ok) return;
+    const d = await r.json();
+    if (d.video !== D.video.key) return;
+    fb.pointing = d.pointing || {};
+    fb.situation = {};
+    (d.situation || []).forEach(x => { const i = D.plan.windows.findIndex(w => w.start === x.start); if (i >= 0) fb.situation[i] = x.label; });
+  } catch (e) {}
+}
+
+let status = '';
+function setStatus(t) { status = t; counts(); }
+
+const save = () => { store.set(KEY, fb); counts(); push(); };
+
+function counts() {
+  const p = Object.keys(fb.pointing).length;
+  const s = Object.keys(fb.situation).length;
+  document.getElementById('count').textContent = p + ' cue marks, ' + s + ' window changes' + (status ? ', ' + status : (served ? '' : ', not saved to disk (open through run_review.py)'));
+}
+
+function thumbs(items) {
+  return '<div class="thumbs">' + items.filter(i => i.src).map(i =>
+    '<figure><img loading="lazy" src="' + i.src + '" alt=""><figcaption>' + esc(i.cap) + '</figcaption></figure>').join('') + '</div>';
+}
+
+// ---------- 1 ingest
+function ingest() {
+  const c = D.context;
+  return '<h2 id="ingest">1 Ingest</h2><p class="lead">What the pipeline heard. Check the transcript for wrong words and the context for wrong facts.</p>' +
+    '<div class="card"><strong>Summary</strong><br>' + esc(c.summary || '') + '<br><span class="muted small">Setting: ' + esc(c.setting || 'none') + '</span><br>' +
+    '<span class="muted small">Topics: ' + esc((c.topics || []).join(', ')) + '</span><br><span class="muted small">Entities: ' + esc((c.entities || []).join(', ')) + '</span></div>' +
+    '<details><summary>Transcript (' + D.transcript.length + ' lines)</summary><table>' +
+    D.transcript.map(t => '<tr><td class="muted">' + fmt(t.t) + '</td><td>' + esc(t.text) + '</td></tr>').join('') + '</table></details>';
+}
+
+// ---------- 2 onion
+function cueRow(c) {
+  const mark = fb.pointing[c.key];
+  return '<div class="row" style="align-items:flex-start;border-top:1px solid var(--line);padding:8px 0">' +
+    '<div style="width:150px">' + (c.thumb ? '<img loading="lazy" src="' + c.thumb + '" style="width:150px;border-radius:6px;border:1px solid var(--line)" alt="">' : '') + '<div class="muted small">' + fmt(c.start) + '</div></div>' +
+    '<div class="grow"><span class="chip ' + (c.score >= D.onion.threshold ? 'hot' : '') + '">' + c.score.toFixed(2) + '</span><strong>' + esc(c.text) + '</strong><br>' +
+    '<span class="muted small">lexical ' + c.vector.lexical + ', entity ' + c.vector.entity + ', llm ' + c.vector.llm + ', emphasis ' + c.vector.emphasis + '</span><br>' +
+    '<span class="small">Does the speech refer to something visible right here? </span>' +
+    '<button data-p="' + c.key + '" data-v="1" class="' + (mark === true ? 'on-yes' : '') + '">Yes</button> ' +
+    '<button data-p="' + c.key + '" data-v="0" class="' + (mark === false ? 'on-no' : '') + '">No</button> ' +
+    '<button data-p="' + c.key + '" data-v="">Clear</button></div></div>';
+}
+
+function onionCard(s) {
+  let text = esc(s.text);
+  s.cues.forEach(c => {
+    const e = esc(c.text);
+    text = text.replace(e, '<mark title="score ' + c.score + '">' + e + '</mark>');
+  });
+  const sig = Object.entries(s.signals || {}).map(([k, v]) => k + ' ' + v).join(', ');
+  return '<div class="card" id="seg' + s.id + '">' +
+    '<strong>#' + s.id + '  ' + fmt(s.start) + ' to ' + fmt(s.end) + '</strong> ' +
+    '<span class="chip">weight ' + s.weight.toFixed(2) + '</span><span class="chip ' + (s.likely ? 'hot' : '') + '">best cue ' + s.pointing.toFixed(2) + '</span>' +
+    '<span class="chip" title="' + esc(sig) + '">ends with border ' + s.border.toFixed(2) + '</span>' +
+    '<p>' + text + '</p>' + (s.cues.length ? s.cues.map(cueRow).join('') : '<div class="muted small">No cues in this segment.</div>') + '</div>';
+}
+
+function onion() {
+  const total = D.video.duration;
+  const tl = D.onion.segments.map(s =>
+    '<div class="' + (s.likely ? 'hot' : '') + '" style="flex:' + (s.end - s.start) + ';opacity:' + (0.25 + 0.75 * s.weight).toFixed(2) +
+    '" title="#' + s.id + ' ' + fmt(s.start) + ' weight ' + s.weight.toFixed(2) + '" onclick="document.getElementById(\'seg' + s.id + '\').scrollIntoView()"></div>').join('');
+  return '<h2 id="onion">2 Onion</h2><p class="lead">Segments with borders, weights and pointing cues. Bar height is equal, brightness is weight, outline means likely pointing. ' +
+    'Each highlighted phrase is a cue. Mark Yes when the speech refers to something visible at that moment (a gesture, an object, an animation, a meme, a document or text on screen), No when it is just talk.</p>' +
+    '<div class="card small">Settings now: border threshold <code>' + D.onion.params.border_threshold + '</code>, min and max segment <code>' + D.onion.params.min_segment_s + '</code> to <code>' + D.onion.params.max_segment_s +
+    '</code> s, pointing threshold <code>' + D.onion.params.pointing_threshold + '</code>, direction <code>' + esc(JSON.stringify(D.onion.params.pointing_direction)) + '</code><br>' +
+    '<span class="muted">Change with <code>--set=onion.BORDER_THRESHOLD=0.6</code> on <code>pipeline/run_onion.py</code>. LLM layer: ' + esc(D.onion.llm_layer) + '.</span></div>' +
+    '<div class="timeline">' + tl + '</div>' + D.onion.segments.map(onionCard).join('');
+}
+
+// ---------- 3 plan
+function plan() {
+  const L = D.plan.labels;
+  const legend = '<div class="legend">' + L.map(l => '<span><i style="background:var(--' + l + ')"></i>' + l + '</span>').join('') + '</div>';
+  const cells = D.plan.windows.map((w, i) => {
+    const cur = fb.situation[i] || w.label;
+    return '<div data-w="' + i + '" class="' + (fb.situation[i] ? 'changed' : '') + '" style="background:var(--' + cur + ')" title="' + fmt(w.start) + ' ' + cur + ' (model said ' + w.predicted + ')"></div>';
+  }).join('');
+  const segs = D.plan.segments.map(s => {
+    const st = L.map(l => '<div style="width:' + (s.situation[l] * 100) + '%;background:var(--' + l + ')"></div>').join('');
+    return '<div class="card"><div class="row"><div class="grow"><strong>#' + s.id + '  ' + fmt(s.start) + ' to ' + fmt(s.end) + '</strong> ' +
+      '<span class="chip">' + esc(s.mode) + '</span><span class="chip">focus ' + s.focus.toFixed(2) + '</span><span class="chip">' + s.cuts.length + ' cuts</span>' +
+      '<div class="stack" style="margin-top:6px">' + st + '</div></div><div>' +
+      thumbs(s.keyframes.map(k => ({ src: k.thumb, cap: fmt(k.t) + ' ' + k.reason }))) + '</div></div></div>';
+  }).join('');
+  return '<h2 id="plan">3 Plan</h2><p class="lead">What the picture is doing, per 2 second window. Click a window to change its label if the colour is wrong; the model then learns from you. ' +
+    'Below, the mode picked for each segment and the keyframes chosen.</p>' + legend +
+    '<div class="strip" id="strip">' + cells + '</div>' +
+    '<div class="small muted">Windows: ' + esc(JSON.stringify(D.plan.model.window_counts)) + '. Labels from ' + esc(D.plan.model.labels_from) + '. ' +
+    'Settings: <code>--set=boost.CUT_HIST=0.35</code>, <code>boost.SPEED_MOVE</code>, <code>boost.JERK_SHAKY</code>, <code>boost.RESID_SUBJECT</code>.</div>' + segs;
+}
+
+// ---------- 4 masks
+function maskKeyframe(k) {
+  const items = k.items.map(i => '<span class="chip" title="' + esc(i.detail) + '">' + esc(i.kind) + ': ' + esc(i.name) + '</span>').join('');
+  const text = k.text.length ? '<div class="small"><span class="muted">Text read: </span>' + k.text.map(t => '"' + esc(t) + '"').join(', ') + '</div>' : '';
+  const crops = k.crops.concat(k.unlabeled.map(u => ({ prompt: 'unnamed', caption: u.caption, thumb: u.thumb })));
+  const strip = crops.length ? '<div class="thumbs">' + crops.map(c => '<figure><img loading="lazy" src="' + c.thumb + '" alt=""><figcaption>' + esc(c.prompt) + ': ' + esc(c.caption || '') + '</figcaption></figure>').join('') + '</div>' : '';
+  return '<div style="border-top:1px solid var(--line);padding:8px 0"><div class="row"><div style="width:300px">' +
+    (k.thumb ? '<img loading="lazy" src="' + k.thumb + '" style="width:300px;border-radius:6px;border:1px solid var(--line)" alt="">' : '') + '<div class="muted small">' + fmt(k.t) + '</div></div>' +
+    '<div class="grow">' + items + text + (k.missed.length ? '<div class="muted small">Named but not found: ' + esc(k.missed.join(', ')) + '</div>' : '') + '</div></div>' + strip + '</div>';
+}
+
+function masks() {
+  const out = D.masks.segments.map(s => {
+    if (s.skipped) return '<div class="card small muted"><strong>#' + s.id + '</strong> ' + esc(s.mode) + ': skipped, ' + esc(s.skipped) + '</div>';
+    const objs = Object.entries(s.objects).map(([p, o]) => '<span class="chip">' + esc(p) + ' ' + o.keyframes_found + '/' + s.keyframes.length + ' kf, ' + o.best_score.toFixed(2) + '</span>').join('') || '<span class="muted small">nothing found</span>';
+    return '<div class="card"><strong>#' + s.id + '  ' + fmt(s.start) + '</strong> <span class="chip">' + esc(s.mode) + '</span> ' + objs +
+      '<details><summary>' + s.keyframes.length + ' keyframes</summary>' + s.keyframes.map(maskKeyframe).join('') + '</details></div>';
+  }).join('');
+  return '<h2 id="masks">4 Masks</h2><p class="lead">What the vision LLM saw in each keyframe (kind: name), the text it read, the SAM3 overlay, and a caption for every cropped thing. ' +
+    'Look for animated or abstract things that are missing or wrongly described. ' +
+    'Prompts from the speech: ' + esc(D.masks.prompts.join(', ')) + '.</p>' + out;
+}
+
+// ---------- 5 agents
+function agents() {
+  if (!D.agents) return '<h2 id="agents">5 Agents</h2><p class="lead">No agent run yet.</p>';
+  const segs = D.agents.segments.map(s => '<div class="card small"><strong>#' + s.id + '  ' + fmt(s.start) + '</strong><br>' + esc(s.summary) +
+    s.moments.map(m => '<div><span class="chip hot">' + esc(m.at || '') + '</span>' + (m.said ? '"' + esc(m.said) + '" ' : '') + esc(m.what) + (m.target ? ' <span class="muted">(' + esc(m.target) + ')</span>' : '') + '</div>').join('') + '</div>').join('');
+  const chapters = D.agents.chapters.map(c => '<div class="card"><strong>' + fmt(c.start) + ' to ' + fmt(c.end) + '  ' + esc(c.title) + '</strong><br>' + esc(c.summary) + '</div>').join('');
+  return '<h2 id="agents">5 Agents</h2><p class="lead">Notes per segment, chapters, and the final summary. Check facts against the video.</p>' +
+    '<div class="card"><pre>' + esc(D.agents.final) + '</pre></div><h3>Chapters</h3>' + chapters +
+    '<details><summary>Segment notes (' + D.agents.segments.length + ')</summary>' + segs + '</details>';
+}
+
+async function start() {
+  await pull();
+  document.getElementById('app').innerHTML =
+    '<h1>' + esc(D.video.name) + '</h1><p class="lead">' + fmt(D.video.duration) + ' long. Mark what is wrong; with run_review.py your marks are saved to disk by themselves. Then run <code>python pipeline/tune.py</code>.</p>' +
+    ingest() + onion() + plan() + masks() + agents();
+  counts();
+}
+
+document.addEventListener('click', e => {
+  const b = e.target.closest('button[data-p]');
+  if (b) {
+    const id = b.dataset.p, v = b.dataset.v;
+    if (v === '') delete fb.pointing[id]; else fb.pointing[id] = v === '1';
+    save();
+    document.querySelectorAll('button[data-p="' + id + '"]').forEach(x => {
+      x.classList.toggle('on-yes', x.dataset.v === '1' && fb.pointing[id] === true);
+      x.classList.toggle('on-no', x.dataset.v === '0' && fb.pointing[id] === false);
+    });
+    return;
+  }
+  const w = e.target.closest('#strip div');
+  if (w) {
+    const i = +w.dataset.w, L = D.plan.labels, orig = D.plan.windows[i].label;
+    const cur = fb.situation[i] || orig;
+    const next = L[(L.indexOf(cur) + 1) % L.length];
+    if (next === orig) delete fb.situation[i]; else fb.situation[i] = next;
+    w.style.background = 'var(--' + next + ')';
+    w.classList.toggle('changed', !!fb.situation[i]);
+    w.title = fmt(D.plan.windows[i].start) + ' ' + next + ' (model said ' + D.plan.windows[i].predicted + ')';
+    save();
+  }
+});
+
+document.getElementById('download').onclick = () => {
+  const out = exportState();
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(out, null, 2)], { type: 'application/json' }));
+  a.download = 'feedback.json';
+  a.click();
+};
+start();
+</script>
+</body>
+</html>

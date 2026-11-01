@@ -1,8 +1,13 @@
 
 import sys
 
+import knobs
+
 from onion import onion
 from video_processor import clock
+
+
+knobs.apply()
 
 
 # -----------------------------------------

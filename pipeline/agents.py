@@ -30,7 +30,10 @@ RETRY_S = 30
 MAX_TOOL_CALLS = 2
 
 # Images shown to the agent per segment: 1 for a calm segment, up to this for the most important
-MAX_IMAGES = 4
+MAX_IMAGES = 6
+
+# Things listed to the agent per segment (named, then text, then unnamed regions)
+MAX_THINGS = 16
 
 CHAPTER_SEGMENTS = 8
 FINAL_FAN_IN = 8
@@ -39,13 +42,16 @@ OBSERVER_PROMPT = (
     "You are describing one segment of a video for a running summary.\n\n"
     "{core}\n\n"
     "THIS SEGMENT\n{evidence}\n\n"
+    "THINGS SEEN IN THIS SEGMENT (use these ids)\n{things}\n\n"
     "Images: {images}\n\n"
     "Use the evidence above first; it is already checked. Tell only what is new in this segment and do not repeat "
-    "the story so far. Say what is shown or pointed at, and name it. If the images and the speech are not enough "
-    "to tell, say so. Do not use em dashes.\n"
-    'Reply with only a JSON object: {{"summary": "one to three sentences", "events": ["short items"], '
+    "the story so far. Something may be shown or pointed at in many ways: a hand gesture, an object held up, an animation, "
+    "a meme, a document or text on screen. For each moment where the speech refers to something visible, say what it is "
+    "in as much detail as the evidence allows (how it looks, what it says), and give its id from the list, or null if it is not listed. "
+    "If the images and the speech are not enough to tell, say so. Do not use em dashes.\n"
+    'Reply with only a JSON object: {{"summary": "two to four sentences", "events": ["short items"], '
     '"objects": [{{"name": "...", "detail": "..."}}], '
-    '"pointing": {{"happening": true or false, "target": "name or null", "evidence": "..."}}}}\n'
+    '"moments": [{{"at": "m:ss", "said": "short quote", "target_id": "T1 or null", "what": "what is shown or pointed at, in detail"}}]}}\n'
     "{tools}"
 )
 
@@ -67,7 +73,7 @@ CHAPTER_PROMPT = (
 FINAL_PROMPT = (
     "Write the final summary of a video from the notes below. Use these sections: "
     "Overview (three or four sentences), Timeline (one line per part with its times), "
-    "Key moments (where something is shown or pointed at, with the time), Objects and people. "
+    "Key moments (each place where something is shown or pointed at, with the time and what it was in detail: how it looks, what it says, whether it is an animation, a meme, a document or an object), Objects and people. "
     "Do not invent anything that is not in the notes. Do not use em dashes.\n\n"
     "VIDEO: {video}\n\nPARTS:\n{parts}\n\nSHOWN OR POINTED AT:\n{pointing}\n\nOBJECTS AND PEOPLE:\n{objects}"
 )
@@ -114,19 +120,25 @@ def parse_object(text):
 def clean_observation(obj, reply):
 
     if not isinstance(obj, dict) or "summary" not in obj:
-        return {"summary": reply.strip()[:600], "events": [], "objects": [], "pointing": {"happening": False, "target": None, "evidence": ""}}
+        return {"summary": reply.strip()[:600], "events": [], "objects": [], "moments": []}
 
-    pointing = obj.get("pointing") if isinstance(obj.get("pointing"), dict) else {}
+    moments = []
+
+    for m in obj.get("moments", []) if isinstance(obj.get("moments"), list) else []:
+
+        if isinstance(m, dict) and str(m.get("what", "")).strip():
+            moments.append({
+                "at": str(m.get("at", "")),
+                "said": str(m.get("said", "")),
+                "target_id": str(m["target_id"]) if m.get("target_id") else None,
+                "what": str(m["what"]).strip()
+            })
 
     return {
         "summary": str(obj["summary"]).strip(),
         "events": [str(e) for e in obj.get("events", []) if e],
         "objects": [o for o in obj.get("objects", []) if isinstance(o, dict)],
-        "pointing": {
-            "happening": bool(pointing.get("happening")),
-            "target": pointing.get("target") or None,
-            "evidence": str(pointing.get("evidence", ""))
-        }
+        "moments": moments
     }
 
 
@@ -248,11 +260,66 @@ class Run:
 
     # -- evidence for one segment ------------------------------------------
 
+    def things_seen(self, seg_id):
+
+        mk = self.masks[seg_id]
+
+        masked_items, other_items, texts, unlabeled = [], [], [], []
+
+        keys = set()
+
+        def fresh(key):
+            if key in keys:
+                return False
+            keys.add(key)
+            return True
+
+        for k in mk["keyframes"]:
+
+            best = {}
+
+            for d in k["detections"]:
+                best.setdefault(d["prompt"], d)
+
+            for it in k["items"]:
+
+                hit = best.get(it["name"])
+
+                if fresh(("item", it["name"])):
+
+                    detail = it["detail"] or (hit or {}).get("caption") or ""
+
+                    row = {"kind": it["kind"], "name": it["name"], "detail": detail, "t": k["t"],
+                           "crop": (hit or {}).get("crop"), "masked": f"masked, score {hit['score']:.2f}" if hit else "not masked"}
+
+                    (masked_items if hit else other_items).append(row)
+
+            for d in k["detections"]:
+                if fresh(("item", d["prompt"])):
+                    masked_items.append({"kind": "object", "name": d["prompt"], "detail": d.get("caption") or "", "t": k["t"],
+                                         "crop": d.get("crop"), "masked": f"masked, score {d['score']:.2f}"})
+
+            for text in k["text"]:
+                if fresh(("text", text.lower())):
+                    texts.append({"kind": "text", "name": f'"{text}"', "detail": "", "t": k["t"], "crop": None, "masked": "read from the picture"})
+
+            for u in k["unlabeled"]:
+                if u.get("caption") and fresh(("unlabeled", u["caption"][:40].lower())):
+                    unlabeled.append({"kind": "unnamed region", "name": "region without a name", "detail": u["caption"], "t": k["t"],
+                                      "crop": u["crop"], "masked": f"segmented, score {u['score']:.2f}"})
+
+        things = (masked_items + other_items + texts + unlabeled)[:MAX_THINGS]
+
+        for n, t in enumerate(things, 1):
+            t["id"] = f"T{n}"
+
+        return things
+
     def evidence(self, seg_id):
 
         on, pl, mk = self.onion[seg_id], self.plan[seg_id], self.masks[seg_id]
 
-        cues = "; ".join(f'"{c["text"]}" ({c["score"]:.2f})' for c in on["cues"] if c["score"] >= 0.3) or "none"
+        cues = "; ".join(f'"{c["text"]}" at {clock(c["start"])} ({c["score"]:.2f})' for c in on["cues"] if c["score"] >= 0.3) or "none"
 
         mostly = max(pl["situation"], key=pl["situation"].get)
 
@@ -316,6 +383,13 @@ class Run:
 
         paths, notes = self.images_for(seg_id)
 
+        things = self.things_seen(seg_id)
+
+        things_text = "\n".join(
+            f"{t['id']} [{t['kind']}] {t['name']}" + (f": {t['detail']}" if t["detail"] else "") + f" (seen at {clock(t['t'])}, {t['masked']})"
+            for t in things
+        ) or "nothing listed"
+
         self.extra_images = []
 
         tool_results = []
@@ -329,6 +403,7 @@ class Run:
             prompt = OBSERVER_PROMPT.format(
                 core=self.memory.core_text(),
                 evidence=self.evidence(seg_id),
+                things=things_text,
                 images="; ".join(f"{n + 1}. {note}" for n, note in enumerate(notes)) or "none",
                 tools=TOOLS_DOC.format(left=left) if left else "No tools are left, answer now."
             )
@@ -349,6 +424,12 @@ class Run:
             break
 
         result = clean_observation(obj, reply)
+
+        by_id = {t["id"]: t for t in things}
+
+        # Tie each moment to the thing it points at, with that thing's own details
+        for m in result["moments"]:
+            m["target"] = by_id.get(m["target_id"])
 
         result["id"] = seg_id
         result["tools_used"] = len(tool_results)
@@ -439,8 +520,9 @@ class Run:
         parts = "\n".join(f"{clock(c['start'])} to {clock(c['end'])}  {c['title']}: {c['summary']}" for c in self.chapters)
 
         pointing = "\n".join(
-            f"[{clock(self.onion[r['id']]['start'])}] {r['pointing']['target']}: {r['pointing']['evidence']}"
-            for r in self.results if r["pointing"]["happening"]
+            f"[{m['at'] or clock(self.onion[r['id']]['start'])}] said \"{m['said']}\": {m['what']}"
+            + (f" (item {m['target']['id']}, {m['target']['kind']}: {m['target']['name']})" if m.get("target") else "")
+            for r in self.results for m in r["moments"]
         ) or "none"
 
         objects = "\n".join(f"{n}: {e['detail']}" for n, e in sorted(self.memory.entities.items(), key=lambda x: -x[1]["weight"])) or "none"

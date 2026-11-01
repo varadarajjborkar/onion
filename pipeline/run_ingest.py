@@ -1,8 +1,13 @@
 
 import sys
 
+import knobs
+
 from ingest import Ingest
 from video_processor import clock
+
+
+knobs.apply()
 
 
 # -----------------------------------------

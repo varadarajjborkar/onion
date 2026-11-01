@@ -9,11 +9,22 @@ import torch
 
 from PIL import Image, ImageDraw
 from pycocotools import mask as mask_util
+from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+from sam2.build_sam import build_sam2
 from sam3.model.sam3_image_processor import Sam3Processor
 from sam3.model_builder import build_sam3_image_model
 
 
 CHECKPOINT = r"C:\sam3\checkpoints\sam3.pt"
+SAM2_CONFIG = "configs/sam2.1/sam2.1_hiera_b+.yaml"
+SAM2_CHECKPOINT = r"C:\sam2\checkpoints\sam2.1_hiera_base_plus.pt"
+
+# "Segment everything" keeps regions no name matched: not tiny specks, not the whole frame, not already found
+AMG_SIDE = 1024
+UNLABELED_MIN_AREA = 0.004
+UNLABELED_MAX_AREA = 0.6
+KNOWN_OVERLAP = 0.6
+SAME_OVERLAP = 0.5
 
 MAX_PER_PROMPT = 5
 CROP_MARGIN = 0.15
@@ -89,7 +100,56 @@ def save_crop(image, box, path):
     crop.save(path, quality=92)
 
 
-def process(processor, item, job_dir, out_dir):
+def find_unlabeled(amg, image, known, item_id, out_dir, limit):
+
+    scale = min(1.0, AMG_SIDE / max(image.size))
+    small = image.resize((max(1, int(image.width * scale)), max(1, int(image.height * scale))))
+    total = small.width * small.height
+
+    known = [np.array(Image.fromarray(m.astype(np.uint8) * 255).resize(small.size, Image.NEAREST)) > 127 for m in known]
+
+    kept = []
+
+    for ann in sorted(amg.generate(np.array(small)), key=lambda a: -(a["predicted_iou"] * a["stability_score"])):
+
+        seg = ann["segmentation"]
+        area = int(seg.sum())
+
+        if not (UNLABELED_MIN_AREA <= area / total <= UNLABELED_MAX_AREA):
+            continue
+
+        if any((seg & k).sum() / area > KNOWN_OVERLAP for k in known):
+            continue
+
+        if any((seg & other).sum() / (seg | other).sum() > SAME_OVERLAP for _, other in kept):
+            continue
+
+        kept.append((ann, seg))
+
+        if len(kept) == limit:
+            break
+
+    found, out = [], []
+
+    image_scale = 1.0 / scale
+
+    for n, (ann, seg) in enumerate(kept):
+
+        x, y, w, h = ann["bbox"]
+        box = [x * image_scale, y * image_scale, (x + w) * image_scale, (y + h) * image_scale]
+
+        crop = f"crops/{item_id}_u{n}.jpg"
+        save_crop(image, box, os.path.join(out_dir, crop))
+
+        out.append({"box": [round(v, 1) for v in box], "area_frac": round(float(seg.mean()), 5),
+                    "score": round(float(ann["predicted_iou"]), 4), "crop": crop})
+
+        found.append(("?", seg, box, float(ann["predicted_iou"])))
+
+    return out, found
+
+
+def process(processor, amg, item, job_dir, out_dir, limit):
 
     image = Image.open(os.path.join(job_dir, "in", item["file"])).convert("RGB")
 
@@ -136,12 +196,21 @@ def process(processor, item, job_dir, out_dir):
 
                 found.append((prompt, mask, box, float(scores[j])))
 
+    unlabeled = []
+
+    if amg is not None:
+
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            unlabeled, extra = find_unlabeled(amg, image, [m for _, m, _, _ in found], item["id"], out_dir, limit)
+
+        found += extra
+
     overlay = f"overlays/{item['id']}.jpg"
     draw_overlay(image, found, os.path.join(out_dir, overlay))
 
     return {
         "id": item["id"], "segment": item["segment"], "t": item["t"], "size": [image.width, image.height],
-        "detections": detections, "missed": missed, "overlay": overlay, "seconds": round(time.time() - t0, 2)
+        "detections": detections, "unlabeled": unlabeled, "missed": missed, "overlay": overlay, "seconds": round(time.time() - t0, 2)
     }
 
 
@@ -167,12 +236,19 @@ def main():
         model = build_sam3_image_model(checkpoint_path=CHECKPOINT, load_from_HF=False)
         processor = Sam3Processor(model, confidence_threshold=spec.get("threshold", 0.4))
 
+        amg = None
+
+        if spec.get("everything"):
+            sam2 = build_sam2(SAM2_CONFIG, SAM2_CHECKPOINT, device="cuda", apply_postprocessing=False)
+            amg = SAM2AutomaticMaskGenerator(sam2, points_per_side=16, points_per_batch=32, pred_iou_thresh=0.8,
+                                             stability_score_thresh=0.9, min_mask_region_area=200)
+
     for n, item in enumerate(todo, 1):
 
         for attempt in (1, 2):
 
             try:
-                result = process(processor, item, job_dir, out_dir)
+                result = process(processor, amg, item, job_dir, out_dir, spec.get("max_unlabeled", 4))
                 break
 
             except torch.cuda.OutOfMemoryError:
@@ -185,7 +261,7 @@ def main():
 
         append_line(results, result)
 
-        print(f"[{n}/{len(todo)}] {item['id']} {result.get('error') or str(len(result['detections'])) + ' detections'}", flush=True)
+        print(f"[{n}/{len(todo)}] {item['id']} {result.get('error') or str(len(result['detections'])) + ' named, ' + str(len(result['unlabeled'])) + ' unnamed'}", flush=True)
 
     with open(os.path.join(out_dir, "done.txt"), "w") as f:
         f.write(time.strftime("%Y-%m-%dT%H:%M:%S"))

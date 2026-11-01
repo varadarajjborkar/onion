@@ -75,12 +75,12 @@ def load_json(path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def ask(prompt, model=None):
+def ask(prompt, model=None, images=()):
 
     for attempt in range(1, LLM_TRIES + 1):
 
         try:
-            return llm_env.describe([], prompt, model=model)
+            return llm_env.describe(list(images), prompt, model=model)
 
         except (RuntimeError, OSError) as err:
 

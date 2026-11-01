@@ -20,10 +20,10 @@ from video_processor import clock
 # Segment borders ---------------------------------
 
 # How strong a border must be (0 to 1) to cut there; higher gives fewer, longer segments
-BORDER_THRESHOLD = 0.45
+BORDER_THRESHOLD = 0.5
 
-MIN_SEGMENT_S = 8.0
-MAX_SEGMENT_S = 45.0
+MIN_SEGMENT_S = 12.0
+MAX_SEGMENT_S = 75.0
 
 # After the first strong border, look this far ahead for an even stronger one
 PEAK_LOOKAHEAD_S = 2.0
@@ -35,10 +35,16 @@ PAUSE_CANDIDATE_S = 0.6
 PAUSE_FULL_S = 1.0
 
 # Words compared on each side of a border for topic and entity shift
-SHIFT_WINDOW_WORDS = 40
+SHIFT_WINDOW_WORDS = 80
 
-# How the border signals are combined (sums to 1)
-BORDER_WEIGHTS = {"pause": 0.30, "sentence": 0.20, "topic": 0.35, "entity": 0.15}
+# How the border signals are combined (sums to 1). The topic signal is ranked against the rest of the
+# video, so it says "more of a shift than most places here", whatever the video. "llm" is the LLM's
+# own reading of where a new part starts; without it the others are scaled up to fill its place.
+BORDER_WEIGHTS = {"pause": 0.12, "sentence": 0.08, "topic": 0.25, "entity": 0.10, "llm": 0.45}
+
+# Lines (sentences or pauses) shown to the LLM per call when it looks for new parts, and how many repeat
+LLM_BORDER_LINES = 50
+LLM_BORDER_OVERLAP = 10
 
 # Pointing cues -----------------------------------
 
@@ -81,6 +87,15 @@ STOPWORDS = set(
     "me my your our their his her this that these those there here then than not no do does did have has had will "
     "would can could should just about into out up down very really also what which who whom how when where why "
     "all any some more most one two like get got going go yeah okay".split()
+)
+
+LLM_BORDER_PROMPT = (
+    "Below are numbered lines of the speech in a video. Find where a new part begins: the topic changes, "
+    "the speaker moves to a new point or example, or a new thing starts being shown. "
+    'Reply with only a JSON list of {{"line": number, "strength": number}}, where line is the FIRST line of the new part '
+    "and strength is 1 for a clear change and 0.5 for a mild one. "
+    "Do not list lines that only continue the same point, even when they start a new sentence. Reply [] if there is none.\n\n"
+    "What the whole video is about: {summary}\n\nLines:\n"
 )
 
 LLM_PROMPT = (
@@ -217,23 +232,95 @@ def border_candidates(words, context):
         before = words[max(0, i + 1 - SHIFT_WINDOW_WORDS):i + 1]
         after = words[i + 1:i + 1 + SHIFT_WINDOW_WORDS]
 
-        topic = cosine_distance(bag(before), bag(after))
-
         e_before = {w["norm"] for w in before if w["norm"] in ents}
         e_after = {w["norm"] for w in after if w["norm"] in ents}
         union = e_before | e_after
-        entity = 1.0 - len(e_before & e_after) / len(union) if union else 0.0
 
-        signals = {
-            "pause": min(max(gap, 0.0) / PAUSE_FULL_S, 1.0),
-            "sentence": 1.0 if sentence else 0.0,
-            "topic": topic,
-            "entity": entity
-        }
+        candidates.append({
+            "idx": i,
+            "time": (words[i]["end"] + words[i + 1]["start"]) / 2,
+            "signals": {
+                "pause": min(max(gap, 0.0) / PAUSE_FULL_S, 1.0),
+                "sentence": 1.0 if sentence else 0.0,
+                "topic": cosine_distance(bag(before), bag(after)),
+                "entity": 1.0 - len(e_before & e_after) / len(union) if union else 0.0
+            }
+        })
 
-        score = sum(BORDER_WEIGHTS[k] * signals[k] for k in signals)
+    # Rank the topic shift against this video's other places: 1.0 is its biggest shift, 0.0 its smallest
+    raw = np.array([c["signals"]["topic"] for c in candidates])
 
-        candidates.append({"idx": i, "time": (words[i]["end"] + words[i + 1]["start"]) / 2, "score": score})
+    if len(raw) > 1:
+        ranks = raw.argsort().argsort() / (len(raw) - 1)
+        for c, r in zip(candidates, ranks):
+            c["signals"]["topic"] = float(r)
+
+    return candidates
+
+
+def llm_border_strengths(words, candidates, summary, cache, model, save):
+
+    # Lines are the stretches of speech between candidate borders; the LLM says which lines start a new part
+    edges = [-1] + [c["idx"] for c in candidates] + [len(words) - 1]
+
+    lines = [" ".join(w["text"] for w in words[edges[k] + 1:edges[k + 1] + 1]) for k in range(len(edges) - 1)]
+
+    strengths = {}
+
+    step = LLM_BORDER_LINES - LLM_BORDER_OVERLAP
+
+    for lo in range(0, len(lines), step):
+
+        hi = min(lo + LLM_BORDER_LINES, len(lines))
+        key = f"{lo}-{hi}"
+
+        if key not in cache:
+
+            text = "\n".join(f"{n + 1}. {lines[n]}" for n in range(lo, hi))
+
+            reply = ask(LLM_BORDER_PROMPT.format(summary=summary or "unknown") + text, model)
+            match = re.search(r"\[.*\]", reply, re.S)
+
+            try:
+                items = json.loads(match.group(0)) if match else []
+            except json.JSONDecodeError:
+                items = []
+
+            cache[key] = [
+                [int(i["line"]), min(max(float(i.get("strength", 1.0)), 0.0), 1.0)]
+                for i in items if isinstance(i, dict) and str(i.get("line", "")).isdigit()
+            ]
+
+            save()
+
+        for line, strength in cache[key]:
+
+            # Line n starts a new part, so the border is after candidate n-2 (line 1 has nothing before it)
+            if 2 <= line <= len(candidates) + 1:
+                strengths[line - 2] = max(strengths.get(line - 2, 0.0), strength)
+
+        if hi == len(lines):
+            break
+
+    return strengths
+
+
+def score_candidates(candidates, strengths=None):
+
+    # Without the LLM signal the others are scaled up to fill its weight
+    weights = {k: v for k, v in BORDER_WEIGHTS.items() if k != "llm" or strengths is not None}
+
+    total = sum(weights.values())
+
+    for k, c in enumerate(candidates):
+
+        signals = dict(c["signals"])
+
+        if strengths is not None:
+            signals["llm"] = strengths.get(k, 0.0)
+
+        c["signals"] = signals
+        c["score"] = sum(weights[n] * signals[n] for n in weights) / total
 
     return candidates
 
@@ -272,7 +359,7 @@ def pick_borders(words, candidates):
         elif remaining > MAX_SEGMENT_S:
             # A run of speech with no pauses or full stops at all: cut by length
             cut = max(i for i in range(first, len(words)) if words[i]["end"] <= seg_start + MAX_SEGMENT_S)
-            pick = {"idx": max(cut, first), "time": words[max(cut, first)]["end"], "score": 0.0}
+            pick = {"idx": max(cut, first), "time": words[max(cut, first)]["end"], "score": 0.0, "signals": {}}
 
         else:
             break
@@ -432,24 +519,37 @@ def onion(manifest_path="processed/ingest.json", use_llm=True, model=None, force
     ents = entity_tokens(context)
     emphasis = word_emphasis(words, manifest["audio"].get("stft_path"))
 
-    borders = pick_borders(words, border_candidates(words, context))
-
-    # Segment i covers words[ranges[i][0] .. ranges[i][1]]
-    ends = [b["idx"] for b in borders] + [len(words) - 1]
-    starts = [0] + [b["idx"] + 1 for b in borders]
-
     # LLM answers are saved as they arrive, so a cut mid-run resumes where it stopped
     cache_path = out_dir / "onion_llm.json"
     stamp = manifest_path.stat().st_mtime_ns
 
-    cache = {"stamp": stamp, "segments": {}}
+    cache = {"stamp": stamp, "segments": {}, "borders": {}}
 
     if cache_path.exists() and not force:
         saved = load_json(cache_path)
         if saved.get("stamp") == stamp:
-            cache = saved
+            cache = {"borders": {}, **saved}
 
     llm_state = "ok" if use_llm else "skipped"
+
+    candidates = border_candidates(words, context)
+
+    # Where does a new part begin? The LLM reads the speech; if it cannot, the other signals decide alone
+    strengths = None
+
+    if use_llm:
+
+        try:
+            strengths = llm_border_strengths(words, candidates, context.get("summary"), cache["borders"], model, lambda: save_json(cache_path, cache))
+
+        except (RuntimeError, OSError):
+            llm_state = "failed"
+
+    borders = pick_borders(words, score_candidates(candidates, strengths))
+
+    # Segment i covers words[starts[i] .. ends[i]]
+    ends = [b["idx"] for b in borders] + [len(words) - 1]
+    starts = [0] + [b["idx"] + 1 for b in borders]
 
     segments = []
 
@@ -490,6 +590,7 @@ def onion(manifest_path="processed/ingest.json", use_llm=True, model=None, force
             "end": seg_words[-1]["end"],
             "text": " ".join(w["text"] for w in seg_words),
             "border_score": round(borders[n]["score"], 3) if n < len(borders) else 0.0,
+            "border_signals": {k: round(v, 2) for k, v in borders[n]["signals"].items()} if n < len(borders) else {},
             "weight": round(weight, 3),
             "pointing": round(pointing, 3),
             "likely_pointing": pointing >= POINTING_THRESHOLD,

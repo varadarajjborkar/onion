@@ -1,11 +1,16 @@
 
 import sys
 
+import knobs
+
 from datetime import datetime
 from pathlib import Path
 
 from agents import Run
 from video_processor import Spinner
+
+
+knobs.apply()
 
 
 # -----------------------------------------

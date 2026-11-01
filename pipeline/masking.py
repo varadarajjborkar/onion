@@ -10,6 +10,8 @@ import cv2
 from collections import Counter
 from pathlib import Path
 
+import discover
+
 from ingest import ask, load_json, save_json
 from onion import STOPWORDS, norm
 from video_processor import Spinner, clock
@@ -43,6 +45,15 @@ PROMPT_MIN = 2
 PROMPT_MAX = 6
 
 ZOOM_MODES = {"mask_and_zoom", "follow_to_target"}
+
+# A calm segment with little speech about showing things is not worth GPU time
+SKIP_BELOW_POINTING = 0.3
+
+# Names sent to SAM3 for one picture: from the speech first, then what the vision LLM saw
+PROMPTS_PER_IMAGE = 10
+
+# Regions kept per picture that no name matched, found by segmenting everything
+MAX_UNLABELED = 4
 
 VISUAL_PROMPT = (
     "Below is a list of things mentioned in the speech of a video. "
@@ -174,12 +185,12 @@ def save_keyframe(cap, t, path):
     tmp.replace(path)
 
 
-def build_job(manifest, onion_result, plan_result, prompts, out_dir):
+def cut_keyframes(manifest, onion_result, plan_result, prompts, out_dir):
 
     key_dir = out_dir / "keyframes"
     key_dir.mkdir(parents=True, exist_ok=True)
 
-    text = {s["id"]: s["text"] for s in onion_result["segments"]}
+    on = {s["id"]: s for s in onion_result["segments"]}
 
     cap = cv2.VideoCapture(manifest["video"]["path"])
 
@@ -187,12 +198,11 @@ def build_job(manifest, onion_result, plan_result, prompts, out_dir):
 
     for seg in plan_result["segments"]:
 
-        chosen = segment_prompts(text[seg["id"]], prompts, seg["mode"], seg["focus"])
-
-        # Nothing worth masking here: spend no GPU time on it
-        if not chosen or (seg["mode"] == "light" and chosen == ["person"]):
+        if seg["mode"] == "light" and on[seg["id"]]["pointing"] < SKIP_BELOW_POINTING:
             skipped[seg["id"]] = "nothing to look for"
             continue
+
+        base = segment_prompts(on[seg["id"]]["text"], prompts, seg["mode"], seg["focus"])
 
         for n, key in enumerate(seg["keyframes"]):
 
@@ -200,20 +210,35 @@ def build_job(manifest, onion_result, plan_result, prompts, out_dir):
 
             save_keyframe(cap, key["t"], key_dir / f"{name}.jpg")
 
-            images.append({
-                "id": name, "file": f"{name}.jpg", "segment": seg["id"], "t": key["t"],
-                "prompts": chosen, "zoom": seg["mode"] in ZOOM_MODES
-            })
+            images.append({"id": name, "file": f"{name}.jpg", "segment": seg["id"], "t": key["t"], "prompts": base, "zoom": seg["mode"] in ZOOM_MODES})
 
     cap.release()
 
-    spec = {"threshold": DETECTION_THRESHOLD, "images": images}
+    return images, skipped
+
+
+def build_job(images, seen, out_dir):
+
+    # Each picture is searched for what the speech names, then for what the vision LLM saw in it
+    full = []
+
+    for img in images:
+
+        names = list(img["prompts"])
+
+        for item in seen.get(img["id"], {}).get("items", []):
+            if item["kind"] != "text" and item["name"] not in names:
+                names.append(item["name"])
+
+        full.append({**img, "prompts": names[:PROMPTS_PER_IMAGE]})
+
+    spec = {"threshold": DETECTION_THRESHOLD, "everything": True, "max_unlabeled": MAX_UNLABELED, "images": full}
 
     job_id = hashlib.sha1(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:10]
 
     save_json(out_dir / "jobs.json", spec)
 
-    return job_id, spec, skipped
+    return job_id, spec
 
 
 # -----------------------------------------
@@ -325,7 +350,9 @@ class RemoteSam:
 # RESULT: what was found, per segment and keyframe
 # -----------------------------------------
 
-def assemble(plan_result, spec, skipped, out_dir):
+def assemble(plan_result, spec, skipped, out_dir, seen=None, captions=None):
+
+    seen, captions = seen or {}, captions or {}
 
     by_id = {}
 
@@ -344,21 +371,25 @@ def assemble(plan_result, spec, skipped, out_dir):
             segments.append({"id": seg["id"], "mode": seg["mode"], "skipped": skipped[seg["id"]], "keyframes": [], "objects": {}})
             continue
 
-        keyframes, seen = [], {}
+        keyframes, found = [], {}
 
         for item in [i for i in spec["images"] if i["segment"] == seg["id"]]:
 
             row = by_id.get(item["id"], {"error": "no result"})
 
+            detections = [{**d, "caption": captions.get(d["crop"])} for d in row.get("detections", [])]
+            unlabeled = [{**u, "caption": captions.get(u["crop"])} for u in row.get("unlabeled", [])]
+
             keyframes.append({
                 "t": item["t"], "image": f"keyframes/{item['file']}",
                 "overlay": f"overlays/{item['id']}.jpg" if "overlay" in row else None,
-                "detections": row.get("detections", []), "missed": row.get("missed", item["prompts"]),
+                "items": seen.get(item["id"], {}).get("items", []), "text": seen.get(item["id"], {}).get("text", []),
+                "detections": detections, "unlabeled": unlabeled, "missed": row.get("missed", item["prompts"]),
                 "error": row.get("error")
             })
 
-            for d in row.get("detections", []):
-                seen.setdefault(d["prompt"], []).append(d)
+            for d in detections:
+                found.setdefault(d["prompt"], []).append(d)
 
         # Per object across the keyframes: how often and how surely it was found
         objects = {
@@ -367,7 +398,7 @@ def assemble(plan_result, spec, skipped, out_dir):
                 "best_score": max(d["score"] for d in ds),
                 "mean_area_frac": round(sum(d["area_frac"] for d in ds) / len(ds), 5)
             }
-            for p, ds in seen.items()
+            for p, ds in found.items()
         }
 
         segments.append({"id": seg["id"], "mode": seg["mode"], "keyframes": keyframes, "objects": objects})
@@ -388,7 +419,13 @@ def mask(manifest_path="processed/ingest.json", onion_path="processed/onion.json
     prompts = visual_prompts(manifest["context"], out_dir / "prompts.json", model)
 
     with Spinner("Cutting keyframes"):
-        job_id, spec, skipped = build_job(manifest, onion_result, plan_result, prompts, out_dir)
+        images, skipped = cut_keyframes(manifest, onion_result, plan_result, prompts, out_dir)
+
+    # What is actually in each picture, in words, including animations, memes and text
+    with Spinner(f"Looking at {len(images)} keyframes"):
+        seen, unseen = discover.discover({i["id"]: out_dir / "keyframes" / i["file"] for i in images}, out_dir / "discovery.json", model)
+
+    job_id, spec = build_job(images, seen, out_dir)
 
     if spec["images"]:
 
@@ -408,7 +445,25 @@ def mask(manifest_path="processed/ingest.json", onion_path="processed/onion.json
     else:
         (out_dir / "results.jsonl").write_text("", encoding="utf-8")
 
-    result = {"job": job_id, "prompts": prompts, **assemble(plan_result, spec, skipped, out_dir)}
+    # A caption for every cropped thing, so the details of what was shown are in words
+    crops = {}
+
+    for line in open(out_dir / "results.jsonl", encoding="utf-8"):
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        for d in row.get("detections", []) + row.get("unlabeled", []):
+            if d.get("crop"):
+                crops[d["crop"]] = out_dir / d["crop"]
+
+    with Spinner(f"Describing {len(crops)} crops"):
+        captions, uncaptioned = discover.caption(crops, out_dir / "captions.json", model)
+
+    result = {
+        "job": job_id, "prompts": prompts, "unseen_keyframes": unseen, "uncaptioned_crops": uncaptioned,
+        **assemble(plan_result, spec, skipped, out_dir, seen, captions)
+    }
 
     save_json(out_dir / "masks.json", result)
 
@@ -437,7 +492,7 @@ def look_for(masks_dir, plan_segment, prompts):
         for n, key in enumerate(plan_segment["keyframes"])
     ]
 
-    spec = {"threshold": DETECTION_THRESHOLD, "images": images}
+    spec = {"threshold": DETECTION_THRESHOLD, "everything": False, "images": images}
 
     job_id = hashlib.sha1(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:10]
 

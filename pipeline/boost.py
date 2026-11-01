@@ -41,8 +41,10 @@ PLAN_FOLLOW_FRACTION = 0.15  # share of cut or camera move that makes the target
 PLAN_SHAKY_FRACTION = 0.3
 PLAN_CUT_FRACTION = 0.1
 
-MIN_KEYFRAMES = 2
-MAX_KEYFRAMES = 6
+# Segments are longer now, so each gets more keyframes; the strongest cues are the first to get one
+MIN_KEYFRAMES = 4
+MAX_KEYFRAMES = 10
+MAX_CUE_KEYFRAMES = 4
 KEYFRAME_MIN_GAP_S = 0.75
 
 
@@ -200,7 +202,7 @@ def keyframe_targets(mode, seg, cuts):
     start, end = seg["start"], seg["end"]
     mid = (start + end) / 2
 
-    strong = sorted(seg["cues"], key=lambda c: -c["score"])[:2]
+    strong = sorted(seg["cues"], key=lambda c: -c["score"])[:MAX_CUE_KEYFRAMES]
 
     targets = []
 
@@ -306,7 +308,13 @@ def plan(manifest_path="processed/ingest.json", onion_path="processed/onion.json
             "keyframes": pick_keyframes(samples, mode, seg, cuts, focus)
         })
 
+    windows = [
+        {"start": a, "end": b, "label": lab, "predicted": LABELS[int(proba[i].argmax())]}
+        for i, ((a, b), lab) in enumerate(zip(spans, labels))
+    ]
+
     result = {
+        "windows": windows,
         "model": {
             "kind": "lightgbm" if model is not None else "teacher_only",
             "labels_from": "rules" if not human else f"rules plus {human} human windows",

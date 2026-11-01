@@ -1,6 +1,11 @@
 
+import knobs
+
 from masking import mask
 from video_processor import clock
+
+
+knobs.apply()
 
 
 # -----------------------------------------

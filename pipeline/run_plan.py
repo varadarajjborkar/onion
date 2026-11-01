@@ -1,8 +1,13 @@
 
 import sys
 
+import knobs
+
 from boost import plan
 from video_processor import clock
+
+
+knobs.apply()
 
 
 # -----------------------------------------
