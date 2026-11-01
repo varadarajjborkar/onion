@@ -120,6 +120,11 @@ class VideoProcessor:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         audio_path = self.output_dir / "audio.wav"
+        muted_path = self.output_dir / f"video_muted{self.video_path.suffix}"
+
+        # Write to a .part file first, so a power cut never leaves a half-written output behind
+        audio_part = audio_path.with_name(f"audio.part{audio_path.suffix}")
+        muted_part = muted_path.with_name(f"video_muted.part{muted_path.suffix}")
 
         # Extract audio independently using FFmpeg
         command = [
@@ -131,7 +136,7 @@ class VideoProcessor:
             "-ac", "1",
             "-ar", str(AUDIO_SAMPLE_RATE),
             "-c:a", "pcm_s16le",
-            str(audio_path)
+            str(audio_part)
         ]
 
         subprocess.run(
@@ -140,9 +145,30 @@ class VideoProcessor:
             capture_output=True
         )
 
+        # Extract the picture with no sound (stream copy, so nothing is re-encoded)
+        command = [
+            "ffmpeg",
+            "-y",
+            "-i", str(self.video_path),
+            "-map", "0:v:0",
+            "-an",
+            "-c:v", "copy",
+            str(muted_part)
+        ]
+
+        subprocess.run(
+            command,
+            check=True,
+            capture_output=True
+        )
+
+        audio_part.replace(audio_path)
+        muted_part.replace(muted_path)
+
         return {
             "video_path": str(self.video_path),
-            "audio_path": str(audio_path)
+            "audio_path": str(audio_path),
+            "muted_video_path": str(muted_path)
         }
 
     # -----------------------------------------
@@ -297,10 +323,19 @@ class VideoProcessor:
 
         model = WhisperModel(model_size, device="cpu", compute_type="int8")
 
-        segments, _ = model.transcribe(waveform, vad_filter=True)
+        # Word timings let later stages place a spoken word on the timeline exactly
+        segments, _ = model.transcribe(waveform, vad_filter=True, word_timestamps=True)
 
         return [
-            {"start": s.start, "end": s.end, "text": s.text.strip()}
+            {
+                "start": s.start,
+                "end": s.end,
+                "text": s.text.strip(),
+                "words": [
+                    {"start": w.start, "end": w.end, "text": w.word.strip()}
+                    for w in (s.words or [])
+                ]
+            }
             for s in segments
         ]
 

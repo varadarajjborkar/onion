@@ -5,3 +5,5 @@ llm_env.py
 sample/*
 logs/*
 *.txt
+mine.py
+data/
